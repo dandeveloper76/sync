@@ -94,6 +94,7 @@ function add_lentes_fields()
     echo '</div>';
     echo '</div>';
 }
+
 add_action('woocommerce_product_data_panels', 'add_lentillas_fields');
 function add_lentillas_fields()
 {
@@ -123,6 +124,7 @@ function add_lentillas_fields()
     echo '</div>';
     echo '</div>';
 }
+
 add_action('woocommerce_product_data_panels', 'add_gafas_fields');
 function add_gafas_fields()
 {
@@ -224,7 +226,6 @@ function create_api_products_table()
     require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
     dbDelta($sql);
 }
-
 register_activation_hook(__FILE__, 'create_api_products_table');
 
 function custom_increase_http_request_timeout($timeout)
@@ -235,117 +236,72 @@ add_filter('http_request_timeout', 'custom_increase_http_request_timeout');
 
 run_woosync_plugin();
 
-// Codigo NUEVO  //
-//
-// --- Funcionalidad de sincronización de clientes --- //
-add_action('admin_menu', 'woosync_admin_menu');
-function woosync_admin_menu()
-{
-    add_menu_page(
-        'Sincronizar Clientes',
-        'WooSync',
-        'manage_options',
-        'woosync_clientes',
-        'woosync_clientes_page',
-        'dashicons-sync',
-        30
-    );
+
+function registrer_cron() {
+    if ( ! wp_next_scheduled( 'cron_job' ) ) {        
+        wp_schedule_event( strtotime( '06:55:00' ), 'daily', 'cron_job' );        
+        wp_schedule_event( strtotime( '13:55:00' ), 'daily', 'cron_job' );        
+    }
 }
+register_activation_hook( __FILE__, 'registrer_cron' );
 
-// Página de administración para sincronización de clientes
-function woosync_clientes_page()
-{
-    ?>
-    <div class="wrap">
-        <h1>Sincronización de Clientes desde la API</h1>
-        <?php
-        if (isset($_POST['sync_clientes'])) {
-            $clientes = woosync_obtener_clientes();
-            if (!empty($clientes)) {
-                echo '<div class="updated"><p>Clientes sincronizados correctamente.</p></div>';
-            } else {
-                echo '<div class="error"><p>No se encontraron clientes o hubo un error en la sincronización.</p></div>';
-            }
-        }
-        ?>
-        <form method="post" action="">
-            <input type="submit" name="sync_clientes" class="button-primary" value="Sincronizar Clientes">
-        </form>
-        <?php
-        $clientes = woosync_obtener_clientes();
-        if (!empty($clientes)) {
-            echo '<table>';
-            echo '<thead><tr><th>Nombre</th><th>NIF</th></tr></thead><tbody>';
-            foreach ($clientes as $cliente) {
-                $nombre = $cliente['Nombre'] ?? 'N/A';
-                $nif = $cliente['Documento_identidad'] ?? 'N/A';
-                echo "<tr><td>" . esc_html($nombre) . "</td><td>" . esc_html($nif) . "</td></tr>";
-            }
-            echo '</tbody></table>';
-        } else {
-            echo '<p>No se encontraron clientes sincronizados.</p>';
-        }
-        ?>
-    </div>
-    <?php
+function write_log_info() {
+    $filename = 'log.txt';
+    $filepath = plugin_dir_path( __FILE__ );
+    $file = fopen($filepath.$filename, 'a');
+    fwrite( $file, "Fecha: " . date( 'Y-m-d H:i:s' ) . PHP_EOL );        
+    fclose( $file );
 }
+add_action( 'cron_job', 'write_log_info' );
 
-// Obtener clientes desde la API utilizando cURL
-function woosync_obtener_clientes()
-{
-    $access_token = '993054F9-5074-4CEA-85FE-7271D15221D9'; // Token
-    $base_url = 'http://shop.visualgesopt.com:8099/api/select/Clientes'; 
-    $filter = ' (Fecha ge 5/6/2019) and (Fecha lt 6/6/2019)'; 
+function delete_cron_job() {
+    $timestamp = wp_next_scheduled( 'cron_job' );
+    wp_unschedule_event( $timestamp, 'cron_job' );
+}
+register_deactivation_hook( __FILE__, 'delete_cron_job' );
 
-    // Construcción de la URL final
-    $url = $base_url . '?filter=' . urlencode($filter);
+add_action('woocommerce_check_cart_items', 'verificar_stock_cart', 10, 0);
 
-    // Registro la URL generada
-    error_log('URL generada: ' . $url);
-
-    // Inicializar cURL
-    $ch = curl_init();
-
-    // Configuración de la solicitud cURL
-    curl_setopt($ch, CURLOPT_URL, $url); // La URL de la API
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true); // Obtener la respuesta como string
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Authorization: Bearer ' . $access_token, // El token de acceso en el encabezado
-        'Content-Type: application/json' // Establecer el tipo de contenido como JSON
-    ]);
+function verificar_stock_cart() {    
     
-    // Ejecutar la solicitud
-    $response = curl_exec($ch);
+    $plugin = new WooSyncPlugin();
+    $plugin->woosync_login_api();
+    foreach (WC()->cart->get_cart() as $cart_item_key => $cart_item) {        
+        
+        $product = $cart_item['data'];
+        $sku_producto = $product->get_sku();
+        $product_id = $product->get_id();
+        $codigo = get_post_meta($product_id, '_Codigo', true);
+        
+        //check product in API
+        $product_data = $plugin->check_API_product($sku_producto);
+        //Update Product in DB
+        $plugin->insert_product_into_db($product_data);
+        //Update Product in WC
+        $plugin->create_or_update_product($product_data);
 
-    // Verificar si hubo algún error con cURL
-    if(curl_errno($ch)) {
-        error_log('Error en la solicitud cURL: ' . curl_error($ch));
-        curl_close($ch); // Cerrar cURL
-        return [];
+        if ($product->get_stock_quantity() < $cart_item['quantity']) {        
+            wc_add_notice(
+                sprintf(
+                    'Lo siento, pero no hay suficiente stock para el producto "%s". Quedan solo %d unidades.',
+                    $product->get_name(),
+                    $product->get_stock_quantity()
+                ),
+                'error'
+            );
+        }
     }
+    $plugin->woosync_logout_api();
+}
 
-    // Verificar el código de respuesta HTTP
-    $status_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    if ($status_code !== 200) {
-        error_log('Código de respuesta HTTP: ' . $status_code);
-        error_log('Respuesta: ' . $response);
-        curl_close($ch); // Cerrar cURL
-        return [];
-    }
+add_action('woocommerce_update_products', 'update_products', 10, 0);
 
-    // Cerrar cURL
-    curl_close($ch);
+function update_products(){
+   
+    $plugin = new WooSyncPlugin();
+    $plugin->sync_products();
+    $plugin->sync_wc_products();
 
-    // Decodificar la respuesta JSON
-    $clientes = json_decode($response, true);
-
-    // Verificar errores en la decodificación JSON
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        error_log('Error en el formato JSON: ' . json_last_error_msg());
-        return [];
-    }
-
-    return $clientes ?? [];
 }
 
 
