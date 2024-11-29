@@ -23,6 +23,9 @@ class WooSyncPlugin
                 case 'sync_wc_products':
                     add_action('admin_notices', [$this, 'sync_wc_products']);
                     break;
+                case 'update_product':
+                    add_action('admin_notices', [$this, 'update_product'],10,1);
+                    break;    
             }
         }
 
@@ -82,7 +85,6 @@ class WooSyncPlugin
             'woosync-sync-logs',
             [$this, 'woosync_mostrar_logs']
         );
-		
     }
 
     public function woosync_mostrar_configuracion()
@@ -197,11 +199,20 @@ class WooSyncPlugin
 
     public function woosync_mostrar_product()
     {
+
         ?>
         <div class="wrap">
             <h1>Actualizar un producto</h1>
             <p>Sincronizar 1 producto individualmente</p>
-
+        </div>
+        <div class="wrap">           
+            <p>Introduce el sku del producto a actualizar</p>
+            <form method="post" action="">
+                <input type="hidden" name="woosync_action" value="update_product" />
+                <input type="text" name="woosync_sku"/>
+                <input type="submit" name="woosync_sync_button" class="button-primary"
+                    value="Actualizar Productos">
+            </form>
         </div>
         <?php
     }
@@ -255,14 +266,14 @@ class WooSyncPlugin
 
         if (is_wp_error($response)) {
             return 'Error de conexión: ' . $response->get_error_message();
-        }
-
+        }        
         $response_headers = wp_remote_retrieve_headers($response);
+        $response_body = wp_remote_retrieve_body($response);
         if (isset($response_headers['Access-Token'])) {
             $this->access_token = $response_headers['Access-Token'];
             return [$response_headers['Access-Token']];
-        } else {
-            return 'Error de autenticación: ' . ($data['error'] ?? 'Desconocido');
+        } else {            
+            return 'Error de autenticación: ' . ($response_body ?? 'Desconocido');
         }
     }
 
@@ -342,6 +353,7 @@ class WooSyncPlugin
                 if (isset($data->data) && is_array($data->data)) {
                     foreach ($data->data as $product) {
                         $this->insert_product_into_db($product);
+                        //$this->create_or_update_product($product);
                     }
 
                     if (count($data->data) < $top) {
@@ -365,7 +377,6 @@ class WooSyncPlugin
 
     }
 
-
     public function sync_wc_products()
     {
         // Recupera los productos desde la base de datos
@@ -383,17 +394,35 @@ class WooSyncPlugin
 
         echo '<div class="updated"><p>¡Productos sincronizados correctamente en WooCommerce!</p></div>';
     }
+
+    public function update_product($woosync_sku)
+    {
+        if ( isset( $_POST['woosync_sku'] )) {
+            $code = $_POST['woosync_sku'];
+        }        
+        //check product in API
+        $product_data = $this->check_API_product($code);
+        if(isset($product_data)){
+            //Update Product in DB
+            $this->insert_product_into_db($product_data);
+            //Update Product in WC
+            $this->create_or_update_product($product_data);
+            echo '<div class="updated"><p>¡Producto actualizado correctamente!</p></div>';    
+        }
+        
+    }
+ 
+
     /**
      * Inserta los datos del producto en la tabla temporal.
      */
-    private function insert_product_into_db($product)
+    public function insert_product_into_db($product)
     {
         global $wpdb;
         $table_name = $wpdb->prefix . 'api_products';
 
         // Extraer los atributos del nombre del producto si están presentes.
-        $product_name_parts = explode('/', $product->Producto);
-
+        $product_name_parts = explode('/', $product->Producto);        
         // Asumimos que el nombre del producto tiene una estructura similar a "Proveedor/Marca/Modelo/Color" y extraemos estos valores
         $proveedor = count($product_name_parts) > 3 && isset($product_name_parts[0]) ? $product_name_parts[0] : null;
         $modelo = count($product_name_parts) > 3 && isset($product_name_parts[2]) ? $product_name_parts[2] : null;
@@ -509,6 +538,7 @@ class WooSyncPlugin
             )
         );
     }
+
 
     /**
      * Formatea el nombre del producto padre según el tipo.
@@ -847,7 +877,7 @@ class WooSyncPlugin
     private function update_existing_product($product_id, $product_data)
     {
         $product = wc_get_product($product_id);
-        echo '<b>EXISTEIX</b>: ' . $product_data->Producto . ' ------ ' . $product_data->Precio_venta . ' €<br>';
+        //echo '<b>EXISTEIX</b>: ' . $product_data->Producto . ' ------ ' . $product_data->Precio_venta . ' €<br>';
         if ($product) {
             $product->set_name($product_data->Producto);
             $product->set_regular_price($product_data->Precio_venta);
@@ -907,9 +937,126 @@ class WooSyncPlugin
 
         wp_set_post_terms($product_id, $category_ids, 'product_cat');
     }
+
+    public function check_API_product($codigo){
+        
+        $this->woosync_login_api();
+        
+        //$url = $this->options['woosync_api_url'] . "/select/Articulos?filter=(Codigo%20eq%$codigo)&fields=Existencias,Codigo";
+        $url = $this->options['woosync_api_url'] . "/select/Articulos?filter=(Codigo%20eq%20$codigo)";        
+        $response = wp_remote_get($url, [
+            'headers' => [
+                'Access-Token' => $this->access_token,
+            ]
+        ]);        
+
+        $response_code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+        $data_set = array();        
+        if ($response_code === 200) {
+            $data = json_decode(json_decode($body, true));
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                echo '<div class="error"><p>Error decodificando JSON: ' . json_last_error_msg() . '</p></div>';    
+
+            }
+            if (isset($data->data) && is_array($data->data)) {
+                $data_set = $data->data[0];
+            } else {
+                echo '<div class="error"><p>Error: No se encontraron datos de productos en la respuesta de la API.</p></div>';               
+            }
+        } else {
+            echo '<div class="error"><p>Error en la sincronización: Código de respuesta ' . $response_code . '</p></div>';      
+            return;              
+        }
+        $this->woosync_logout_api();
+        
+        return $data_set;
+    }
+
+    public function check_API_client($dni_client){
+
+        $this->woosync_login_api();
+        $url = $this->options['woosync_api_url'] . "/select/Clientes?filter=(Documento_identidad%20eq%20'$code_client')";        
+        $response = wp_remote_get($url, [
+            'headers' => [
+                'Access-Token' => $this->access_token,
+            ]
+        ]);   
+        $this->woosync_logout_api();
+
+        $response_code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+        $data_set = array();        
+        if ($response_code === 200) {
+            $data = json_decode(json_decode($body, true));
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                echo '<div class="error"><p>Error decodificando JSON: ' . json_last_error_msg() . '</p></div>';    
+                return false;
+            }
+            if (isset($data->data) && is_array($data->data)) {
+                $data_set = $data->data[0];
+                return true;
+            } else {
+                echo '<div class="error"><p>Error: No se ha encontrado un cliente con ese DNI</p></div>';    
+                return false;           
+            }
+        } else {
+            echo '<div class="error"><p>Error en la sincronización: Código de respuesta ' . $response_code . '</p></div>';      
+            return false;              
+        }                
+    }
+
+
+//Pendent de revisió, només està el codi de "presuntament" ha de funcionar
+
+    public function set_API_client($data_client){
+
+        $data_client_json = json_encode($data_client);
+
+        $this->woosync_login_api();
+        $url = $this->options['woosync_api_url'] . "/insert/Clientes?data=urlencode($data_client_json)";        
+        $response = wp_remote_get($url, [
+            'headers' => [
+                'Access-Token' => $this->access_token,
+            ]
+        ]);   
+        $this->woosync_logout_api();
+        
+        $response_code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+        $data_set = array();        
+        if ($response_code === 200) {
+            $data = json_decode(json_decode($body, true));
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                echo '<div class="error"><p>Error decodificando JSON: ' . json_last_error_msg() . '</p></div>';    
+                return false;
+            }
+            if (isset($data->data) && is_array($data->data)) {
+                $data_set = $data->data[0];
+                return true;
+            } else {
+                echo '<div class="error"><p>Error: No se ha podido crear el cliente</p></div>';    
+                return false;           
+            }
+        } else {
+            echo '<div class="error"><p>Error en la sincronización: Código de respuesta ' . $response_code . '</p></div>';      
+            return false;              
+        }                
+    }
+
+    public function insert_API_factura($facuta, $client){
+
+        $this->woosync_login_api();
+        $url = $this->options['woosync_api_url'] . "/insert/Factura?data=urlencode($data_client_json)";        
+        $response = wp_remote_get($url, [
+            'headers' => [
+                'Access-Token' => $this->access_token,
+            ]
+        ]);   
+        $this->woosync_logout_api();
+
+    }
 }
 
 // codigo nuevo
-
-
 ?>
